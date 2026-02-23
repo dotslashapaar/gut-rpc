@@ -5095,15 +5095,31 @@ impl Bank {
         calculated_accounts_lt_hash: Option<&AccountsLtHash>,
     ) -> bool {
         let (verified_accounts, verify_accounts_time_us) = measure_us!({
-            let should_verify_accounts = !self.rc.accounts.accounts_db.skip_initial_hash_calc
-                && !self.is_rpc_mode;
+            let should_verify_accounts = !self.rc.accounts.accounts_db.skip_initial_hash_calc;
             if should_verify_accounts {
-                self.verify_accounts(
-                    VerifyAccountsHashConfig {
-                        require_rooted_bank: false,
-                    },
-                    calculated_accounts_lt_hash,
-                )
+                if self.is_rpc_mode {
+                    // In RPC mode, adopt the freshly calculated accounts lt hash
+                    // instead of verifying against the (possibly stale) stored value.
+                    // - External snapshot (first boot): calculated matches stored, no-op.
+                    // - Own RPC snapshot (restart): stored hash is stale; replace it
+                    //   with the correct value so the node has an accurate lt hash.
+                    if let Some(calculated) = calculated_accounts_lt_hash {
+                        info!(
+                            "RPC mode: adopting calculated accounts lt hash \
+                             (checksum: {})",
+                            calculated.0.checksum()
+                        );
+                        *self.accounts_lt_hash.lock().unwrap() = calculated.clone();
+                    }
+                    true
+                } else {
+                    self.verify_accounts(
+                        VerifyAccountsHashConfig {
+                            require_rooted_bank: false,
+                        },
+                        calculated_accounts_lt_hash,
+                    )
+                }
             } else {
                 info!("Verifying accounts... Skipped.");
                 true
