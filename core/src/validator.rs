@@ -1014,7 +1014,7 @@ impl Validator {
             .validator_exit_backpressure
             .get(SnapshotPackagerService::NAME)
             .cloned();
-        let enable_gossip_push = true;
+        let enable_gossip_push = !config.voting_disabled;
         let snapshot_packager_service = SnapshotPackagerService::new(
             pending_snapshot_packages.clone(),
             starting_snapshot_hashes,
@@ -2228,6 +2228,7 @@ fn load_blockstore(
         use_snapshot_archives_at_startup: config.use_snapshot_archives_at_startup,
         ..blockstore_processor::ProcessOptions::default()
     };
+    process_options.runtime_config.is_rpc_mode = config.voting_disabled;
 
     let (blockstore, bank_from_snapshot_opt) = thread::scope(|scope| {
         let load_snapshot_handle = thread::Builder::new()

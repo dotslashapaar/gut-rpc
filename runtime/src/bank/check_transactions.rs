@@ -275,6 +275,69 @@ impl Bank {
             .get_status(key, transaction_blockhash, &self.ancestors)
             .map(|status| status.0)
     }
+
+    /// Fast-path transaction check for RPC-mode replay.
+    ///
+    /// Skips blockhash age verification, nonce account state lookup, and
+    /// status-cache dedup. Computes only the compute budget and fee details
+    /// that the SVM needs to execute the transaction. Derives the nonce
+    /// address (if any) from the message alone — no account state access.
+    pub(super) fn build_check_results_for_rpc_mode(
+        &self,
+        sanitized_txs: &[impl TransactionWithMeta],
+        lock_results: &[TransactionResult<()>],
+    ) -> Vec<TransactionCheckResult> {
+        let feature_set: &FeatureSet = &self.feature_set;
+        let fee_features = FeeFeatures::from(feature_set);
+        let raise_cpi_limit = feature_set.is_active(&raise_cpi_nesting_limit_to_8::id());
+        let require_static_nonce_account = feature_set
+            .is_active(&agave_feature_set::require_static_nonce_account::id());
+
+        sanitized_txs
+            .iter()
+            .zip(lock_results)
+            .map(|(tx, lock_res)| match lock_res {
+                Ok(()) => {
+                    let compute_budget_and_limits = tx
+                        .compute_budget_instruction_details()
+                        .sanitize_and_convert_to_compute_budget_limits(feature_set)
+                        .map(|limit| {
+                            let fee_budget = FeeBudgetLimits::from(limit);
+                            let fee_details = calculate_fee_details(
+                                tx,
+                                false,
+                                self.fee_structure.lamports_per_signature,
+                                fee_budget.prioritization_fee,
+                                fee_features,
+                            );
+                            if let Some(compute_budget) = self.compute_budget {
+                                compute_budget.get_compute_budget_and_limits(
+                                    fee_budget.loaded_accounts_data_size_limit,
+                                    fee_details,
+                                )
+                            } else {
+                                limit.get_compute_budget_and_limits(
+                                    fee_budget.loaded_accounts_data_size_limit,
+                                    fee_details,
+                                    raise_cpi_limit,
+                                )
+                            }
+                        })?;
+
+                    // Derive nonce address from the message alone (no account state lookup).
+                    let nonce_address = tx
+                        .get_durable_nonce(require_static_nonce_account)
+                        .copied();
+
+                    Ok(CheckedTransactionDetails::new(
+                        nonce_address,
+                        compute_budget_and_limits,
+                    ))
+                }
+                Err(e) => Err(e.clone()),
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

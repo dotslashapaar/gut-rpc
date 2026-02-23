@@ -14,4 +14,7 @@ pub struct RuntimeConfig {
     pub compute_budget: Option<ComputeBudget>,
     pub log_messages_bytes_limit: Option<usize>,
     pub transaction_account_lock_limit: Option<usize>,
+    /// When true, this node is a non-voting RPC node.
+    /// Skips consensus-only validation on the replay write path.
+    pub is_rpc_mode: bool,
 }

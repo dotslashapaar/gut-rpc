@@ -137,6 +137,9 @@ pub struct TransactionProcessingConfig<'a> {
     /// failing transactions to be committed. If both flags are set then any
     /// failing transaction will cause all transactions to be aborted.
     pub all_or_nothing: bool,
+    /// When true, skip pre/post lamport balance and rent-state checks.
+    /// Used by RPC-mode replay to skip consensus-only validation.
+    pub skip_balance_and_rent_checks: bool,
 }
 
 /// Runtime environment for transaction batch processing.
@@ -944,8 +947,11 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             })
         }
 
-        let lamports_before_tx =
-            transaction_accounts_lamports_sum(&transaction_accounts).unwrap_or(0);
+        let lamports_before_tx = if config.skip_balance_and_rent_checks {
+            0
+        } else {
+            transaction_accounts_lamports_sum(&transaction_accounts).unwrap_or(0)
+        };
 
         let compute_budget = loaded_transaction.compute_budget;
 
@@ -957,8 +963,15 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             tx.num_instructions(),
         );
 
-        let pre_account_state_info =
-            TransactionAccountStateInfo::new(&transaction_context, tx, &environment.rent);
+        let pre_account_state_info = if config.skip_balance_and_rent_checks {
+            None
+        } else {
+            Some(TransactionAccountStateInfo::new(
+                &transaction_context,
+                tx,
+                &environment.rent,
+            ))
+        };
 
         let log_collector = if config.recording_config.enable_log_recording {
             match config.log_messages_bytes_limit {
@@ -1007,14 +1020,18 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
         let mut status = process_result
             .and_then(|info| {
-                let post_account_state_info =
-                    TransactionAccountStateInfo::new(&transaction_context, tx, &environment.rent);
-                TransactionAccountStateInfo::verify_changes(
-                    &pre_account_state_info,
-                    &post_account_state_info,
-                    &transaction_context,
-                )
-                .map(|_| info)
+                if let Some(ref pre_state_info) = pre_account_state_info {
+                    let post_account_state_info =
+                        TransactionAccountStateInfo::new(&transaction_context, tx, &environment.rent);
+                    TransactionAccountStateInfo::verify_changes(
+                        pre_state_info,
+                        &post_account_state_info,
+                        &transaction_context,
+                    )
+                    .map(|_| info)
+                } else {
+                    Ok(info)
+                }
             })
             .map_err(|err| {
                 match err {
@@ -1051,7 +1068,8 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             accounts_resize_delta: accounts_data_len_delta,
         } = execution_record;
 
-        if status.is_ok()
+        if !config.skip_balance_and_rent_checks
+            && status.is_ok()
             && transaction_accounts_lamports_sum(&accounts)
                 .filter(|lamports_after_tx| lamports_before_tx == *lamports_after_tx)
                 .is_none()
