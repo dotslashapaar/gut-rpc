@@ -246,7 +246,12 @@ pub fn execute_batch<'a>(
         // Block verification (including unified scheduler) case;
         // collect and check transaction costs
         let tx_costs = get_transaction_costs(bank, &commit_results, batch.sanitized_transactions());
-        check_block_cost_limits(bank, &tx_costs).map(|_| tx_costs)
+        if bank.is_rpc_mode() {
+            // In RPC mode, skip cost limit enforcement
+            Ok(tx_costs)
+        } else {
+            check_block_cost_limits(bank, &tx_costs).map(|_| tx_costs)
+        }
     } else if record_transaction_meta {
         // Unified scheduler block production case;
         // the scheduler will track costs elsewhere but costs are recalculated

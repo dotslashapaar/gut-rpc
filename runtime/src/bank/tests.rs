@@ -12782,3 +12782,89 @@ fn test_temporary_account_recreated_execute_and_commit() {
     // Verify account exists with correct balance
     assert_eq!(bank.get_balance(&temp_account_pubkey), transfer_amount - 1);
 }
+
+/// Regression test: simulateTransaction must check blockhash age even in RPC mode.
+/// Before the fix, `load_and_execute_transactions` used `build_check_results_for_rpc_mode`
+/// for all callers when `is_rpc_mode` was true, which skipped blockhash validation.
+/// This caused `simulateTransaction` with an expired blockhash to return success
+/// instead of `BlockhashNotFound`.
+#[test]
+fn test_simulate_rejects_expired_blockhash_in_rpc_mode() {
+    let (genesis_config, mint_keypair) = create_genesis_config(LAMPORTS_PER_SOL);
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    bank.set_is_rpc_mode_for_tests(true);
+    let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
+
+    // Build a transaction with a blockhash that is not in the bank's queue.
+    let expired_blockhash = Hash::new_unique();
+    let message = Message::new(
+        &[system_instruction::transfer(
+            &mint_keypair.pubkey(),
+            &Pubkey::new_unique(),
+            1,
+        )],
+        Some(&mint_keypair.pubkey()),
+    );
+    let transaction = Transaction::new(&[&mint_keypair], message, expired_blockhash);
+
+    bank.freeze();
+    let sanitized = RuntimeTransaction::from_transaction_for_tests(transaction);
+    let simulation = bank.simulate_transaction(&sanitized, false);
+
+    assert_eq!(
+        simulation.result,
+        Err(TransactionError::BlockhashNotFound),
+        "simulateTransaction must reject expired blockhashes even in RPC mode"
+    );
+}
+
+/// Verify that the replay fast path (skip_checks=true) bypasses blockhash validation.
+/// This confirms the RPC optimization still works for the replay commit path.
+#[test]
+fn test_replay_fast_path_skips_blockhash_check() {
+    let (genesis_config, mint_keypair) = create_genesis_config(LAMPORTS_PER_SOL);
+    let bank = Bank::new_for_tests(&genesis_config);
+    let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
+
+    // Build a transaction with a blockhash that is not in the bank's queue.
+    let expired_blockhash = Hash::new_unique();
+    let recipient = Pubkey::new_unique();
+    let message = Message::new(
+        &[system_instruction::transfer(
+            &mint_keypair.pubkey(),
+            &recipient,
+            1,
+        )],
+        Some(&mint_keypair.pubkey()),
+    );
+    let transaction = Transaction::new(&[&mint_keypair], message, expired_blockhash);
+    let batch = bank.prepare_batch_for_tests(vec![transaction]);
+
+    let output = bank.load_and_execute_transactions(
+        &batch,
+        MAX_PROCESSING_AGE,
+        true, // skip_checks: simulate the RPC replay fast path
+        &mut ExecuteTimings::default(),
+        &mut TransactionErrorMetrics::default(),
+        TransactionProcessingConfig {
+            account_overrides: None,
+            check_program_deployment_slot: false,
+            log_messages_bytes_limit: None,
+            limit_to_load_programs: false,
+            recording_config: ExecutionRecordingConfig::new_single_setting(false),
+            drop_on_failure: false,
+            all_or_nothing: false,
+            skip_balance_and_rent_checks: false,
+        },
+    );
+
+    // With skip_checks=true, the expired blockhash should NOT cause rejection.
+    // The transaction should proceed to execution (and succeed or fail for
+    // execution reasons, not pre-validation).
+    assert_eq!(output.processing_results.len(), 1);
+    let result = &output.processing_results[0];
+    assert!(
+        !matches!(result, Err(e) if *e == TransactionError::BlockhashNotFound),
+        "replay fast path must not reject transactions for expired blockhash"
+    );
+}

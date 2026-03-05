@@ -5,6 +5,10 @@ target/
 /solana-metrics/
 /solana-metrics.tar.bz2
 /test-ledger/
+/test-ledger-rpc/
+ledger.lock
+bank_hash_details/
+.claude/
 
 **/*.rs.bk
 .cargo

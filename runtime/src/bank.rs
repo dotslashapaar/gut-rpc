@@ -585,6 +585,7 @@ impl PartialEq for Bank {
             drop_callback: _,
             freeze_started: _,
             vote_only_bank: _,
+            is_rpc_mode: _,
             cost_tracker: _,
             accounts_data_size_initial: _,
             accounts_data_size_delta_on_chain: _,
@@ -888,6 +889,10 @@ pub struct Bank {
 
     vote_only_bank: bool,
 
+    /// True when this bank belongs to a non-voting RPC node.
+    /// Skips consensus-only validation on the replay write path.
+    is_rpc_mode: bool,
+
     cost_tracker: RwLock<CostTracker>,
 
     /// The initial accounts data size at the start of this Bank, before processing any transactions/etc
@@ -1142,6 +1147,7 @@ impl Bank {
             drop_callback: RwLock::new(OptionalDropCallback(None)),
             freeze_started: AtomicBool::default(),
             vote_only_bank: false,
+            is_rpc_mode: false,
             cost_tracker: RwLock::<CostTracker>::default(),
             accounts_data_size_initial: 0,
             accounts_data_size_delta_on_chain: AtomicI64::new(0),
@@ -1390,6 +1396,7 @@ impl Bank {
                     .map(|drop_callback| drop_callback.clone_box()),
             )),
             freeze_started: AtomicBool::new(false),
+            is_rpc_mode: parent.is_rpc_mode,
             cost_tracker: RwLock::new(parent.read_cost_tracker().unwrap().new_from_parent_limits()),
             accounts_data_size_initial,
             accounts_data_size_delta_on_chain: AtomicI64::new(0),
@@ -1814,6 +1821,11 @@ impl Bank {
         self.vote_only_bank
     }
 
+    /// Returns true when this bank belongs to a non-voting RPC node.
+    pub fn is_rpc_mode(&self) -> bool {
+        self.is_rpc_mode
+    }
+
     /// Like `new_from_parent` but additionally:
     /// * Doesn't assume that the parent is anywhere near `slot`, parent could be millions of slots
     ///   in the past
@@ -1933,7 +1945,14 @@ impl Bank {
             drop_callback: RwLock::new(OptionalDropCallback(None)),
             freeze_started: AtomicBool::new(fields.hash != Hash::default()),
             vote_only_bank: false,
-            cost_tracker: RwLock::new(CostTracker::default()),
+            is_rpc_mode: runtime_config.is_rpc_mode,
+            cost_tracker: RwLock::new({
+                let mut ct = CostTracker::default();
+                if runtime_config.is_rpc_mode {
+                    ct.set_limits(u64::MAX, u64::MAX, u64::MAX);
+                }
+                ct
+            }),
             accounts_data_size_initial,
             accounts_data_size_delta_on_chain: AtomicI64::new(0),
             accounts_data_size_delta_off_chain: AtomicI64::new(0),
@@ -2604,7 +2623,12 @@ impl Bank {
             self.freeze_started.store(true, Relaxed);
             // updating the accounts lt hash must happen *outside* of hash_internal_state() so
             // that rehash() can be called and *not* modify self.accounts_lt_hash.
-            self.update_accounts_lt_hash();
+            // INVARIANT: This skip must always be paired with the early return in
+            // inspect_account(). Both must be gated on is_rpc_mode together —
+            // skipping one without the other will cause silent lt_hash divergence.
+            if !self.is_rpc_mode {
+                self.update_accounts_lt_hash();
+            }
             *hash = self.hash_internal_state();
             self.rc.accounts.accounts_db.mark_slot_frozen(self.slot());
         }
@@ -3356,6 +3380,7 @@ impl Bank {
                 },
                 drop_on_failure: false,
                 all_or_nothing: false,
+                skip_balance_and_rent_checks: false,
             },
         );
 
@@ -3514,12 +3539,19 @@ impl Bank {
     ) -> LoadAndExecuteTransactionsOutput {
         let sanitized_txs = batch.sanitized_transactions();
 
-        let (check_results, check_us) = measure_us!(self.check_transactions(
-            sanitized_txs,
-            batch.lock_results(),
-            max_age,
-            error_counters,
-        ));
+        let (check_results, check_us) = if self.is_rpc_mode {
+            measure_us!(self.build_check_results_for_rpc_mode(
+                sanitized_txs,
+                batch.lock_results(),
+            ))
+        } else {
+            measure_us!(self.check_transactions(
+                sanitized_txs,
+                batch.lock_results(),
+                max_age,
+                error_counters,
+            ))
+        };
         timings.saturating_add_in_place(ExecuteTimingType::CheckUs, check_us);
 
         let (blockhash, blockhash_lamports_per_signature) =
@@ -3860,7 +3892,9 @@ impl Bank {
             );
 
             let to_store = (self.slot(), accounts_to_store.as_slice());
-            self.update_bank_hash_stats(&to_store);
+            if !self.is_rpc_mode {
+                self.update_bank_hash_stats(&to_store);
+            }
             // See https://github.com/solana-labs/solana/pull/31455 for discussion
             // on *not* updating the index within a threadpool.
             self.rc.accounts.store_accounts_seq(
@@ -4089,12 +4123,13 @@ impl Bank {
             &mut TransactionErrorMetrics::default(),
             TransactionProcessingConfig {
                 account_overrides: None,
-                check_program_deployment_slot: self.check_program_deployment_slot,
+                check_program_deployment_slot: if self.is_rpc_mode { false } else { self.check_program_deployment_slot },
                 log_messages_bytes_limit,
                 limit_to_load_programs: false,
                 recording_config,
                 drop_on_failure: false,
                 all_or_nothing: false,
+                skip_balance_and_rent_checks: self.is_rpc_mode,
             },
         );
 
@@ -5062,12 +5097,29 @@ impl Bank {
         let (verified_accounts, verify_accounts_time_us) = measure_us!({
             let should_verify_accounts = !self.rc.accounts.accounts_db.skip_initial_hash_calc;
             if should_verify_accounts {
-                self.verify_accounts(
-                    VerifyAccountsHashConfig {
-                        require_rooted_bank: false,
-                    },
-                    calculated_accounts_lt_hash,
-                )
+                if self.is_rpc_mode {
+                    // In RPC mode, adopt the freshly calculated accounts lt hash
+                    // instead of verifying against the (possibly stale) stored value.
+                    // - External snapshot (first boot): calculated matches stored, no-op.
+                    // - Own RPC snapshot (restart): stored hash is stale; replace it
+                    //   with the correct value so the node has an accurate lt hash.
+                    if let Some(calculated) = calculated_accounts_lt_hash {
+                        info!(
+                            "RPC mode: adopting calculated accounts lt hash \
+                             (checksum: {})",
+                            calculated.0.checksum()
+                        );
+                        *self.accounts_lt_hash.lock().unwrap() = calculated.clone();
+                    }
+                    true
+                } else {
+                    self.verify_accounts(
+                        VerifyAccountsHashConfig {
+                            require_rooted_bank: false,
+                        },
+                        calculated_accounts_lt_hash,
+                    )
+                }
             } else {
                 info!("Verifying accounts... Skipped.");
                 true
@@ -6067,6 +6119,13 @@ impl TransactionProcessingCallback for Bank {
     }
 
     fn inspect_account(&self, address: &Pubkey, account_state: AccountState, is_writable: bool) {
+        // INVARIANT: This early return must always be paired with the
+        // update_accounts_lt_hash() skip in freeze(). Both must be gated
+        // on is_rpc_mode together — skipping one without the other will
+        // cause silent lt_hash divergence.
+        if self.is_rpc_mode {
+            return;
+        }
         self.inspect_account_for_accounts_lt_hash(address, &account_state, is_writable);
     }
 }

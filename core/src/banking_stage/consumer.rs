@@ -353,6 +353,7 @@ impl Consumer {
                     ),
                     drop_on_failure: flags.drop_on_failure,
                     all_or_nothing: flags.all_or_nothing,
+                    skip_balance_and_rent_checks: false,
                 }
             ));
         execute_and_commit_timings.load_execute_us = load_execute_us;
