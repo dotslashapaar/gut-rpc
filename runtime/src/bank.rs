@@ -1826,6 +1826,11 @@ impl Bank {
         self.is_rpc_mode
     }
 
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn set_is_rpc_mode_for_tests(&mut self, is_rpc_mode: bool) {
+        self.is_rpc_mode = is_rpc_mode;
+    }
+
     /// Like `new_from_parent` but additionally:
     /// * Doesn't assume that the parent is anywhere near `slot`, parent could be millions of slots
     ///   in the past
@@ -3365,6 +3370,7 @@ impl Bank {
             // for processing. During forwarding, the transaction could expire if the
             // delay is not accounted for.
             MAX_PROCESSING_AGE - MAX_TRANSACTION_FORWARDING_DELAY,
+            false, // always run full checks for simulation
             &mut timings,
             &mut TransactionErrorMetrics::default(),
             TransactionProcessingConfig {
@@ -3533,13 +3539,14 @@ impl Bank {
         &self,
         batch: &TransactionBatch<impl TransactionWithMeta>,
         max_age: usize,
+        skip_checks: bool,
         timings: &mut ExecuteTimings,
         error_counters: &mut TransactionErrorMetrics,
         processing_config: TransactionProcessingConfig,
     ) -> LoadAndExecuteTransactionsOutput {
         let sanitized_txs = batch.sanitized_transactions();
 
-        let (check_results, check_us) = if self.is_rpc_mode {
+        let (check_results, check_us) = if skip_checks {
             measure_us!(self.build_check_results_for_rpc_mode(
                 sanitized_txs,
                 batch.lock_results(),
@@ -4119,6 +4126,7 @@ impl Bank {
         } = self.load_and_execute_transactions(
             batch,
             max_age,
+            self.is_rpc_mode, // skip checks in RPC mode replay
             timings,
             &mut TransactionErrorMetrics::default(),
             TransactionProcessingConfig {

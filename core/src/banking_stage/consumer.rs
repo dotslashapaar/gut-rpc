@@ -341,6 +341,7 @@ impl Consumer {
             measure_us!(bank.load_and_execute_transactions(
                 batch,
                 MAX_PROCESSING_AGE,
+                false, // never skip checks for block production
                 &mut execute_and_commit_timings.execute_timings,
                 &mut error_counters,
                 TransactionProcessingConfig {
